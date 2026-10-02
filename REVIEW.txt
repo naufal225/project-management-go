@@ -1,0 +1,256 @@
+================================================================================
+REVIEW #2 (re-analysis) — project-management-go (Go + Fiber + GORM)
+Tanggal: 2026-09-13
+Status saat ini: `go build ./...` OK, `go vet ./...` OK.
+Prioritas: [BLOKER] = bug nyata / keamanan, [PENTING] = wajib perbaiki,
+          [SARAN] = standar industri untuk ke depan.
+================================================================================
+
+-------------------------------------------------------------------------------
+A. YANG SUDAH BAIK / PERKEMBANGAN SEJAK REVIEW #1
+-------------------------------------------------------------------------------
+- Build & vet lolos. Login() sudah lengkap dan ada CheckPasswordHash. (+)
+- Interfacing repository/service/controller sudah rapi dan mudah di-mock. (+)
+- Sudah ada: DTO folder, JWT middleware untuk protected route, pagination,
+  refresh token, handler NotFound/UUnauthorized/InternalServerError. (+)
+- Perbaikan kecil: beberapa fungsi mulai memakai dtos.UpdateUserRequest. (+)
+
+-------------------------------------------------------------------------------
+B. BLOKER — BUG FUNGSIONAL YANG HARUS DIPERBAIKI DULU
+-------------------------------------------------------------------------------
+1) [BLOKER] UpdateUser TIDAK PERNAH menyimpan ke database. [SOLVED]
+   Kontroller: controllers/user_controller.go:138-153
+     - Ambil user lama (GetByPublicID), set field Name/Email, lalu LANGSUNG
+       copy ke response dan return Success. `c.services.Update(...)` TIDAK
+       DIPANGGIL sama sekali. Response "Berhasil update data" tapi DB tidak
+       berubah. Fix: hasilnya harus dipanggil lewat service" dan error ditangani.
+   Tambahan bug: services.Update() -> repositories.Update() (line 86-91) hanya
+   meng-update field `name` (map[string]interface{}{"name": ...}).
+   Email yang di-set di controller TIDAK ikut tersimpan. Fix: update name+email
+   atau update seluruh field yang diizinkan.
+
+2) [BLOKER] DeleteUser memakai internal_id, sedangkan Get memakai public_id. [SOLVED]
+   controllers/user_controller.go:156-162 vs routes/route.go:34-36
+   - GET /user/:id dan PUT /user/:id => `id` adalah public_id (uuid).
+   - DELETE /user/:id => `id, _ := strconv.Atoi(...)` => internal_id.
+     Dua interpretasi berbeda untuk parameter yang sama => bug & membingungkan.
+   - Lebih parah: tidak ada otorisasi. Siapa saja yang punya token (user biasa)
+     bisa mendelate user LAIN hanya dengan menebak internal_id.
+     Fix: pakai public_id untuk semua operasi berbasis id, DAN pastikan
+     user yang login hanya bisa menghapus/mengedit dirinya sendiri atau admin.
+
+3) [BLOKER] SQL Injection lewat parameter `sort`.
+   repositories/user_repository.go:61-75
+   - Hanya "id"/"-id" yang di-map, tapi nilai lain langsung dibangun menjadi
+     "ORDER BY <input> ASC/DESC" tanpa whitelist. Input `sort=-id; SELECT
+     pg_sleep(10)--` bisa dieksekusi.
+   - Fix: whitelist kolom yang boleh di-sort (maps). Contoh:
+       sortable := map[string]string{"id":"internal_id","name":"name","email":"email"}
+     Lalu cek set membership. JANGAN pernah mengambil mentah dari query.
+
+4) [BLOKER] Pagination rawan panic/error bila limit/page tidak valid.
+   controllers/user_controller.go:88-122
+   - `page, _ := strconv.Atoi(...)` dan limit juga; tidak divalidasi.
+   - limit=0 => offset negatif & TotalPage = int(math.Ceil(float64(total)/0))
+     => +Inf. encoding/json TIDAK bisa men-serialize +Inf => HTTP 500.
+   - page<=0 => offset negatif => kueri SQL error.
+   - Fix: clamp/validasi: page = max(1), limit = antara 1..100, dsb.
+
+5) [BLOKER] Total pagination dihitung SETELAH Find pada chain yang sama.
+   repositories/user_repository.go:77-81
+   - `db.Limit(limit).Offset(offset).Find(&users)` lalu `db.Count(&total)`.
+     Statement GORM berbagi kondisi; Count rawan ikut kena Limit/Offset/Order,
+     sehingga `total` bisa salah (≈ limit bila ada filter).
+   - Truth: jalankan `db.Count(&total)` dulu SEBELUM menambah Limit/Offset,
+     atau gunakan `db.Session(&gorm.Session{NewDB:true})` untuk query count.
+
+6) [BLOKER] Response `sort` tidak pernah tampil (typo tag).
+   utils/response.go:28
+   - Tag tertulis `jsonL:"sort"` (salah ketik) => ter-serialize sebagai "Sort",
+     bukan "sort". Semua client mengharapkan konsistensi; perbaiki tagnya.
+
+7) [BLOKER] Register masih mem-parsing langsung ke entity models.User.
+   controllers/user_controller.go:24-39
+   - Client masih bisa mengirim `internal_id`, `created_at`, `updated_at`.
+     GORM akan mencoba insert internal_id bila tidak 0 => bisa konflik PK /
+     mengotori data. Role dan PublicID sudah di-override di service (bagus),
+     tapi disarankan gunakan DTO RegisterRequest dan map ke entity.
+
+8) [BLOKER] Password tetap bocor ke JSON.
+   models/user.go:15
+   - `Password string json:"password"` masih belum diubah. Endpoint yang
+     mengembalikan `models.User` (mis. login service) rentan kebocoran hash
+     ke response bila ada route yang serialisasikan entity. Set `json:"-"`.
+
+-------------------------------------------------------------------------------
+C. PENTING — KEAMANAN & ROBUSTNESS
+-------------------------------------------------------------------------------
+9) [PENTING] JWT masih v3 + refresh token tanpa pembeda tipe.
+   - utils/jwt.go memakai `github.com/golang-jwt/jwt v3.2.2+incompatible`
+     (versi lama, ada CVE). gofiber/jwt/v3 middleware pakai jwt/v4.
+     => DUA versi jwt berbeda di go.mod. Upgrade semua ke jwt/v5 saja.
+   - GenerateRefreshToken (utils/jwt.go:31-43) tidak memasukkan claim pembeda
+     seperti `"typ":"refresh"`. Akibatnya refresh token yang sama SAH secara
+     signature & exp untuk diterima oleh middleware JWT => bisa dipakai layaknya
+     access token. Tambahkan claim typ dan validasi di middleware.
+   - Belum ada endpoint `POST /auth/refresh`. Tambahkan untuk memutar token.
+   - `duration, _ := time.ParseDuration(...)` mengabaikan error dua kali
+     (utils/jwt.go:15,33): bila nilai env salah, token jadi langsung kadaluarsa.
+     Propagasikan error.
+
+10) [PENTING] Middleware JWT dipecah tanpa otorisasi role/ownership.
+   - routes/route.go:24-36 semua /user/* dilindungi sessama, tapi tidak dibedakan
+     admin vs user biasa; juga controller tidak pernah membaca claim lalu mem
+     bandingkan dengan resource (siapa pemilik board/user ini).
+   - Best practice: parse claims ke helper (mis. `GetAuthUser(c)`) di tiap
+     handler, lalu chek `user.Role=="admin" || resource.OwnerID == user.ID`.
+
+11) [PENTING] Duplikasi loading .env di routes.
+   routes/route.go:15-18
+   - main.go -> config.LoadEnv() sudah menjalankan godotenv. Routes memanggil
+     godotenv.Load() lagi, dan dengan `log.Fatal` — inkonsisten dengan dimensi
+     toleran di config. Hapus spanduk ini di routes.
+
+12) [PENTING] Config masih pakai fallback rahasia.
+   config/config.go:45 JWT_SECRET, config/config.go:43 DB_PASSWORD.
+   - Secret & password punya default di dalam kode. Kalau env tidak set,
+     aplikasi jalan dengan secret yang bisa ditebak / kredensial yang bocor.
+     Fix: kembalikan error / log.Fatal bila JWT_SECRET & DB_PASSWORD kosong,
+     jangan beri nilai default untuk hal berbau rahasia.
+
+13) [PENTING] Seed admin masih hardcoded & mengabaikan error.
+   database/seed/seed_admin.go
+   - Password "password" hardcoded, di-hash setiap start, hash error diabaikan,
+     PublicID TIDAK di-set (uuid kosong), dan variabel ADMIN_* di .env tidak
+     dipakai. Fix: baca dari env, set PublicID=uuid.New(), perbaiki logika
+     upsert (cari by email, update bila ada), tangani error hash.
+
+14) [PENTING] Belum ada validasi input.
+   - Tidak ada validasi format email, panjang password (mis. >=8), name wajib.
+     Datang dari user tanpa validasi juga suatu masalah (boundary).
+   - Disarankan library `github.com/go-playground/validator/v10` dipakai di DTO
+     atau lapisan service; pesan error yang user-friendly, bukan error DB mentah.
+
+15) [PENTING] Tidak ada middleware standar.
+   - Belum ada recover (Fiber punya `fiber.New(fiber.Config{ErrorHandler})` dan
+     middleware recover), request logging, CORS padahal CORS_ORIGIN ada di .env.
+     Minimum untuk produksi: recover + compress + cors + logger.
+
+16) [PENTING] Migration & skema tidak terkelola.
+   - database/migrations hanya berisi users. Tidak ada mekanisme yang jalan
+     (tidak AutoMigrate, tidak golang-migrate/goose). Tabel board/list/card/dll
+     tidak akan pernah terbentuk di DB.
+   - Pilih satu: (a) AutoMigrate untuk dev, atau (b) golang-migrate + go:embed
+     untuk produksi. (terserah proyek)
+
+17) [PENTING] Tidak ada graceful shutdown & health check.
+   - main.go:31 log.Fatal(app.Listen(...)). Tambahkan sinyal SIGINT/SIGTERM,
+     app.Shutdown(ctx), dan endpoint GET /health.
+
+-------------------------------------------------------------------------------
+D. KONSISTENSI MODEL & TAG (masih ada dari review #1, belum diperbaiki)
+-------------------------------------------------------------------------------
+18) models/board.go:14  `db:"owner_intenal_id"` typo "intenal" (db tag juga
+    tidak dipakai GORM). models/list.go:12 `gorm:"board_public_id"` dan
+    models/list_position.go:10-11 `gorm:"public_id"` / `gorm:"board_internal_id"`
+    => bukan syntax tag yang benar (harus `gorm:"column:..."`).
+19) models/board_member.go:6-8  `BoardID ... primaryKey;autoIncrement` pada
+    join table tidak tepat; composite PK dengan autoIncrement invalid di PG.
+    `gorm:"joined_at"` juga bukan tag valid. Perbaiki jadi composite PK normal.
+20) models/card_assignee.go:5 copy-paste: field UserID memakai
+    `db:"card_internal_id"`. Tambahkan composite primary key (CardID, UserID).
+21) Tipe InternalID tidak konsisten: models/user.go `int` vs model lain `int64`.
+    Seragamkan ke int64 di seluruh model.
+22) Tag `db:"..."` dipakai di SEMUA model tapi tidak berpengaruh apa-apa untuk
+    GORM. Hapus agar tidak membingungkan; cukup `gorm` tag.
+23) Naming JSON Comment membingungkan (CardID=card_internal_id,
+    CardPubID=card_id). Buat pola konsisten: public id => `*_id`, internal id =>
+    `*_internal_id` atau sembunyikan.
+24) Label tidak memiliki BoardID (tidak ter-scope ke board); Board tidak punya
+    UpdatedAt; umumnya tidak ada relasi FK antar model.
+
+-------------------------------------------------------------------------------
+E. BEST PRACTICE YANG WAJIB DITERAPKAN KE DEPAN
+-------------------------------------------------------------------------------
+1. ARSITEKTUR BERLAPIS : controller -> (DTO) -> service -> repository.
+   - Controller: parse & validasi request DTO, panggil service, map response.
+   - Service: business rule, validasi, transaksi, error domain.
+   - Repository: murni akses DB, terima *gorm.DB lewat constructor (JANGAN
+     pakai global config.DB), dan terima context.Context di semua method.
+   Hal yang DIIZINKAN di service melakukan bisnis logika; controller tidak
+   melakukan logika bisnis.
+
+2. ERROR HANDLING:
+   - Jangan `errors.New` acak. Gunakan sentinel/typed error
+     (var ErrNotFound, ErrDuplicate, ErrUnauthorized) + fmt.Errorf("%w, ...").
+   - Buat satu helper untuk map error -> HTTP status di controller
+     (400/404/401/403/500). Jangan semua error jadi 400.
+   - JANGAN abaikan error: `_ =`, `err, _ :=`. Selalu handle atau log. Saat ini
+     ada banyak titik yang mengabaikan error (hash, jwt duration, copier, dll).
+
+3. VALIDASI di lapisan DTO/controller dengan
+   github.com/go-playground/validator/v10 (`validate:"required,email"`).
+   Batasi input untuk mencegah request cocok dengan field internal.
+
+4. SECURITY:
+   - Password: hash bcrypt, `json:"-"` di entity; tidak pernah log.
+   - JWT: v5; typed claims (iat, exp, jti, typ); bedakan access/refresh;
+     tambah endpoint refresh; simpan secret hanya di env & tanpa default;
+     middleware memvalidasi signature + tipe + exp, lalu parse ke *AuthUser.
+   - Otorisasi: selalu check ownership/role di tiap endpoint yang mengubah/
+     menghapus resource milik user.
+   - Rate limiting pada login/register (mis. fiber-limiter).
+   - Sanitasi SQL: jangan pernah membangun query mentah dari input user
+     (sort, filter). Whitelist semua.
+
+5. CONFIG: gunakan tool seperti envconfig/viper; pisahkan Config struct,
+   tidak ada fallback untuk secret; sediakan .env.example yang di-commit.
+
+6. MIGRATION: golang-migrate atau goose dengan go:embed; DI-handle otomatis di
+   startup; atau AutoMigrate untuk development saja. Jangan berharap manual.
+
+7. MIDDLEWARE & SERVER: recover, logger, cors (sesuai .env), compression;
+   graceful shutdown & health check; context timeout di handler.
+
+8. PAGINATION: validasi & batasi (page>=1, 1<=limit<=100), hitung total DENGAN
+   query terpisah (Count sebelum Limit/Offset), jangan div zero.
+
+9. TESTING: wajib untuk regresi.
+   - Unit test service menggunakan mock repository (interface mu dah ada, tinggal
+     buat mock).
+   - Unit test controller via fiber httptest.
+   - Util test (hash, jwt).
+   - Idealnya: repository diuji dengan sqlmock atau database test (docker).
+   Jalankan `go test -race ./...` dan lib `testify` untuk assertion.
+
+10. TOOLING:
+    - gofmt/gofmt -s, goimports.
+    - golangci-lint (errcheck, govet, gosec, staticcheck) di CI.
+    - `govulncheck ./...` untuk CVE (segera: jwt v3 di repo kamu terdampak).
+    - CI pipeline (GitHub Actions): test + lint + build.
+
+11. KONSISTENSI:
+    - Satu konvensi penamaan (internal_id int64), satu bahasa pesan API,
+      satu pola struktur folder, satu pola tag model.
+    - Response envelope satu bentuk standar untuk seluruh endpoint
+      (pakai Response/ResponsePaginated yang seragam).
+
+12. GO IDIOM LAIN: named returns jarang perlu; composition over inheritance;
+    hindari god-object; pertahankan package kecil dengan single responsibility;
+    gunakan context untuk timeout/cancel (mis. timeouts DB); structured logging
+    (log/slog atau zap) bukan log.Println; avoid magic strings.
+
+================================================================================
+RINGKASAN URGENSI (urutan kerja yang disarankan)
+================================================================================
+1) Perbaiki UpdateUser (jangan sampai tidak men-save) & DeleteUser (public_id +
+   otorisasi).          [BLOKER]
+2) Whitelist `sort`, validasi page/limit, perbaiki hitungan total & typo jsonL.
+                         [BLOKER]
+3) Password json:"-", DTO Register, validasi input. [BLOKER/keamanan]
+4) Upgrade JWT ke v5, tambah claim typ + endpoint refresh, parse claims & authz.
+5) Middleware standar + graceful shutdown + health check.
+6) Config tanpa fallback secret + .env.example.
+7) Perbaiki semua tag model & konsisten int64.
+8) Mulai unit test + golangci-lint + govulncheck di CI.
+================================================================================
